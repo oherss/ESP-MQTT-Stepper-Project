@@ -52,7 +52,6 @@ const uint8_t RUN_CURRENT_PERCENT = 100; //how much current to run at (0-100%)
 #define INDEX   11
 
 //PD Trigger (CH224K)
-#define PG      15  //power good singnal (dont enable stepper untill this is good)
 #define CFG1    38
 #define CFG2    48
 #define CFG3    47
@@ -70,13 +69,7 @@ const uint8_t RUN_CURRENT_PERCENT = 100; //how much current to run at (0-100%)
 //Motor speeds
 int delays[] = {15, 2000, 1000, 700, 400, 200, 100, 75, 50, 40, 30}; //list of speeds (higher = slower, 0 = stop)
 int numSpeeds = 10;
-bool runMotor = 0;
-int microSteps = 64;
 
-//Led flashing 
-long lastFlash = 0;
-int flashInt = 100;
-bool flashState = 0;
 
 //MQTT topic
 String MQTTTopic = "ESPStepper";
@@ -96,6 +89,7 @@ String DeviceMessage;
 int Steps = 0;
 int Speed = 0;
 int Dir = 0;
+int microSteps = 256; //Standard value
 
 //WiFi
 WiFiClient espClient;
@@ -106,8 +100,7 @@ unsigned long lastMsg = 0;
 #define MSG_BUFFER_SIZE	(50)
 char msg[MSG_BUFFER_SIZE];
 
-void setup_wifi() {
-
+void setup_wifi() {// Wifi setup
   delay(10);
   // We start by connecting to a WiFi network
   Serial.println();
@@ -118,7 +111,7 @@ void setup_wifi() {
   WiFi.mode(WIFI_STA);
   WiFi.begin(ssid, password);
 
-  while (WiFi.status() != WL_CONNECTED) {
+  while (WiFi.status() != WL_CONNECTED) { //Whie connecting blink LED to show status
     delay(250);
     Serial.print(".");
     digitalWrite(LED1, HIGH);
@@ -133,86 +126,80 @@ void setup_wifi() {
   Serial.println(WiFi.localIP());
 }
 
-void callback(char* topic, byte* payload, unsigned int length) { //Runs whenever we receive a message on the recive topic
-  //recieve message
+void callback(char* topic, byte* payload, unsigned int length) { //Runs whenever we receive a message on the recive a message on subsribed topics
+  //recieve message and print topic to serial monitor
   Serial.print("Message arrived [");
   Serial.print(topic);
   Serial.print("] ");
+
   //combines characters into full string
-  MQTTmsg = "";
+  MQTTmsg = ""; //clear the string
   for (int i = 0; i < length; i++) {
     MQTTmsg += (char)payload[i];
   }
+
   //prints received message to console
   Serial.println(MQTTmsg);
-  Serial.println(topic);
-  Serial.println(recieveTopic.c_str());
-if(String(topic) == recieveTopic){
-  StaticJsonDocument<200> doc;  // Define a JSON document with a suitable size
-  DeserializationError error = deserializeJson(doc, MQTTmsg); //interpret JSON from received message
 
-if (error) { //Prints JSON error to console and via MQTT to user
-    Serial.print("deserializeJson() failed: ");
-    Serial.println(error.f_str());
-    String messageToSend = "Json parse failed: " + String(error.f_str());
-    client.publish(sendTopic.c_str(),  messageToSend.c_str());
-    return;
-  }
+  if(String(topic) == recieveTopic){ //Checks if message is in the command topic
+    StaticJsonDocument<200> doc;  // Define a JSON document with a suitable size
+    DeserializationError error = deserializeJson(doc, MQTTmsg); //interpret JSON from received message
 
-  String StepString = doc["Steps"];
-  if(StepString == "Run"){
-    runMotor = 0;
-    Speed = doc["Speed"];
-    Dir = doc["Dir"];
-    microSteps = doc["MicroSteps"];
-    if (Dir == 1){ //set direction
-      digitalWrite(DIR, HIGH);
-    } else {
-      digitalWrite(DIR, LOW);
-      Speed = -Speed;
+    if (error) { //Prints JSON error to console and via MQTT to user
+        Serial.print("deserializeJson() failed: ");
+        Serial.println(error.f_str());
+        String messageToSend = "Json parse failed: " + String(error.f_str());
+        client.publish(sendTopic.c_str(),  messageToSend.c_str());
+        return;
+      }
+
+    String StepString = doc["Steps"]; //Store the data in "Steps" as a string for comparison 
+
+    if(StepString == "Run"){ //check if constant motion is requested
+      Speed = doc["Speed"];
+      Dir = doc["Dir"];
+      microSteps = doc["MicroSteps"];
+
+      if (Dir == 1){ //set direction
+        digitalWrite(DIR, HIGH);
+      } else {
+        digitalWrite(DIR, LOW);
+        Speed = -Speed;
+      }
+
+      String stringToSend = "Running motor at speed: " + String(Speed) + " at " + String(microSteps) + " microsteps";
+      Speed *= 70; //Scale speed to value stepper driver can understand
+      digitalWrite(TMC_EN, LOW);
+      stepper_driver.setMicrostepsPerStep(microSteps);
+      stepper_driver.enable();
+      stepper_driver.moveAtVelocity(Speed*microSteps); //Starts motion
+      Serial.println(stringToSend);
+      client.publish(sendTopic.c_str(), stringToSend.c_str()); //Sends info back to user via MQTT
     }
-    String stringToSend = "Running motor at speed: " + String(Speed) + " at " + String(microSteps) + " microsteps";
-    Speed *= 70;
-    digitalWrite(TMC_EN, LOW);
-    stepper_driver.setMicrostepsPerStep(microSteps);
-    stepper_driver.enable();
-    stepper_driver.moveAtVelocity(Speed*microSteps);
-    Serial.println(stringToSend);
-    client.publish(sendTopic.c_str(), stringToSend.c_str());
+
+    else if(StepString == "Stop"){ //Check if command is to stop constant motion
+      //digitalWrite(TMC_EN, HIGH);
+      stepper_driver.moveAtVelocity(0);
+      stepper_driver.disable();
+      Serial.println("Motor stopped");
+      client.publish(sendTopic.c_str(),  "Motor stopped");
+    }
+
+    else{ //If not constant motion, intepret amount of steps requested, and run the doSteps() function
+      Steps = doc["Steps"];  // Assuming the JSON contains a parameter named "Steps"
+      Speed = doc["Speed"];  // Assuming the JSON contains a parameter named "Speed"
+      Dir = doc["Dir"];  // Assuming the JSON contains a parameter named "Dir"
+      microSteps = doc["MicroSteps"]; // Assuming the JSON contains a parameter named "MicroSteps"
+      stepper_driver.setMicrostepsPerStep(microSteps); //Sets micro step resolution
+      doSteps(Dir, Steps, Speed); //Runs function for moving the motor
+    }
 
   }
-  else if(StepString == "Stop"){
-    runMotor = 0;
-    //digitalWrite(TMC_EN, HIGH);
-    stepper_driver.moveAtVelocity(0);
-    stepper_driver.disable();
-    Serial.println("Motor stopped");
-    client.publish(sendTopic.c_str(),  "Motor stopped");
-  }
-  else{
-    Steps = doc["Steps"];  // Assuming the JSON contains a parameter named "Steps"
-    Speed = doc["Speed"];  // Assuming the JSON contains a parameter named "Speed"
-    Dir = doc["Dir"];  // Assuming the JSON contains a parameter named "Dir"
-    microSteps = doc["MicroSteps"];
-    stepper_driver.setMicrostepsPerStep(microSteps);
-    doSteps(Dir, Steps, Speed); //Runs function for moving the motor
-  }
 
-  
-
- // Print the extracted values (for debugging)
-  Serial.print("Steps: ");
-  Serial.println(Steps);
-  Serial.print("Speed: ");
-  Serial.println(Speed);
-  Serial.print("Direction: ");
-  Serial.println(Dir);
-}
-else{
-  Serial.println("Sending device info on topic: " + clientTopic);
-  client.publish(clientTopic.c_str(), DeviceMessage.c_str());
-}
-  
+  else{ //If recieved message is not a command, assume it is a pairing command, and send out device info
+    Serial.println("Sending device info on topic: " + clientTopic);
+    client.publish(clientTopic.c_str(), DeviceMessage.c_str());
+  }
 }
 
 void reconnect() { //MQTT connection to server
@@ -224,8 +211,6 @@ void reconnect() { //MQTT connection to server
       Serial.println("connected");
       // Once connected, publish an announcement...
       client.publish(sendTopic.c_str(), "Motor Online");
-      DeviceMessage = "{ResponseTopic: " + sendTopic + ", CommandTopic: " + recieveTopic + ", ID: " + motor_id + ", DeviceType: Stepper_Motor, MinSpeed: 1, MaxSpeed: 10, MaxMicroSteps: 256}"; 
-      client.publish(clientTopic.c_str(), DeviceMessage.c_str());
       Serial.print("Response topic: ");
       Serial.println(sendTopic);
       // ... and resubscribe
@@ -245,28 +230,11 @@ void reconnect() { //MQTT connection to server
   }
 }
 
-String readTMCStatus(){
-  bool hardware_disabled = stepper_driver.hardwareDisabled();
-  if (hardware_disabled){
-   return ("Hardware Disabled");
-  }
-
-  TMC2209::Status status = stepper_driver.getStatus();
-  if (status.over_temperature_warning){
-    return ("Over Temp Warning");
-  }
-  else if (status.over_temperature_shutdown){
-    return ("Over Temp Shutdown");
-  }
-  return ("No Errors");
-}
-
 void setup() {
-  pinMode(LED1, OUTPUT);
-  pinMode(LED2, OUTPUT);
+  pinMode(LED1, OUTPUT); //WiFi status LED
+  pinMode(LED2, OUTPUT); //MQTT status LED
   
-    //PD Trigger Setup
-  pinMode(PG, INPUT);
+    //PD Trigger Setup  (Selects the voltage needed over the USB port, tín this case just 5 volts)
   pinMode(CFG1, OUTPUT);
   pinMode(CFG2, OUTPUT);
   pinMode(CFG3, OUTPUT);
@@ -276,29 +244,30 @@ void setup() {
   digitalWrite(CFG3, LOW);  //  -    0     1     1     0
   
    //Setup serial comms with TMC2209
-  pinMode(MS1, OUTPUT);
-  pinMode(MS1, OUTPUT);
+  pinMode(MS1, OUTPUT); 
+  pinMode(MS2, OUTPUT); 
   pinMode(STEP, OUTPUT);
   pinMode(DIR, OUTPUT);
   pinMode(TMC_EN, OUTPUT);
-  pinMode(DIAG, INPUT);
+  pinMode(DIAG, INPUT); //Response data pin from stepper driver
+
+  //Motor setup
   digitalWrite(TMC_EN, LOW); //Enabled here and later enabled/disabled over UART
 
   digitalWrite(MS1, LOW); //used to set serial address in UART mode
   digitalWrite(MS2, LOW);
 
+
   digitalWrite(LED1, LOW);
   digitalWrite(LED2, LOW);
 
 
-  stepper_driver.setup(serial_stream, SERIAL_BAUD_RATE, TMC2209::SERIAL_ADDRESS_0, TMC_RX, TMC_TX);
-  stepper_driver.setRunCurrent(RUN_CURRENT_PERCENT);
+  stepper_driver.setup(serial_stream, SERIAL_BAUD_RATE, TMC2209::SERIAL_ADDRESS_0, TMC_RX, TMC_TX); //Sets up serial communication with stepper driver from defnied values
+  stepper_driver.setRunCurrent(RUN_CURRENT_PERCENT); // sets motor current to defined value at the top of the code
   stepper_driver.enableAutomaticCurrentScaling(); //current control mode
-//  stepper_driver.enableCoolStep();
   stepper_driver.enableStealthChop(); //stealth chop needs to be enabled for stall detect
-  //stepper_driver.setCoolStepDurationThreshold(5000); //TCOOLTHRS (DIAG only enabled when TSTEP smaller than this)
   stepper_driver.setStandstillMode(stepper_driver.NORMAL);
-  stepper_driver.disable();
+  stepper_driver.disable(); //Disable the motor 
 
 
   //MQTT topics defines
@@ -306,17 +275,17 @@ void setup() {
   sendTopic = MQTTTopic + "/Response"; //A subtopic for sending feedback on the motor's status
   recieveTopic = MQTTTopic + "/Motor"; //A subtopic the motor will listen to 
   clientTopic = MQTTTopicAnnounce + "/Client"; //A subtopic for sending information about the device upon bootup and upon request
-  serverTopic = MQTTTopicAnnounce + "/Server"; //A subtopic the motor will listen to to send info about itself
-
+  serverTopic = MQTTTopicAnnounce + "/Server"; //A subtopic the motor will listen to to send info about itself to the client topic
+  DeviceMessage = "{ResponseTopic: " + sendTopic + ", CommandTopic: " + recieveTopic + ", ID: " + motor_id + ", DeviceType: Stepper_Motor, MinSpeed: 1, MaxSpeed: 10, MaxMicroSteps: 256}"; //The message the device sends during pairing
+  
   //Start preparation code
   delay(500); //delay needed before "Serial.begin" to ensure bootloader mode entered correctly.
-  Serial.begin(115200);
+  Serial.begin(115200); //Start serial connection for debugging at set baud rate
   Serial.println("Code Starting");
   setup_wifi(); //Connect to WiFi
-  client.setServer(mqtt_server, mqtt_port);
+  client.setServer(mqtt_server, mqtt_port); //Define MQTT server attributes
   client.setCallback(callback); //Sets callback function when something arrives on the topic we have subscribed to
   reconnect(); //Connect to the MQTT server
-  
 }
 
 void loop() {
@@ -338,44 +307,36 @@ void loop() {
   }
 
   client.loop(); //MQTT loop
-
-
-  if(runMotor){
-    digitalWrite(STEP, HIGH);
-    delayMicroseconds(delays[Speed]);
-    digitalWrite(STEP, LOW);
-    delayMicroseconds(delays[Speed]);
-  }
 }
 
 void doSteps (int DIRECTION, int STEPS, int STEPSPEED){
   STEPS *= microSteps;
-  if(DIRECTION == 1 || DIRECTION == 0){
-    if(STEPSPEED > 0 && STEPSPEED <= 10){
-      if(STEPS > 0){
+  if(DIRECTION == 1 || DIRECTION == 0){ //Checks for valid direction
+    if(STEPSPEED > 0 && STEPSPEED <= 10){ //checks for valid speed
+      if(STEPS > 0){ //checks for valid amount of steps
         stepper_driver.enableCoolStep();
-        stepper_driver.enable();
-        Serial.println(delays[STEPSPEED]);
-        int moveTime = ((STEPS * delays[STEPSPEED]) + (STEPS * delays[STEPSPEED])) / 1000000;
-        String messageToSend = "{Steps: " + String(STEPS) + ", Speed: " + String(STEPSPEED) + ", TimeToFinish: " + String(moveTime) + ", Status: Running}";
+        stepper_driver.enable(); //enables motor
+        int moveTime = ((STEPS * delays[STEPSPEED]) + (STEPS * delays[STEPSPEED])) / 1000000; //calculate the time it will take to complete any given motion from the parameters given
+        String messageToSend = "{Steps: " + String(STEPS) + ", Speed: " + String(STEPSPEED) + ", TimeToFinish: " + String(moveTime) + ", Status: Running}"; //combined string with all the infor about requested motion and its status
         client.publish(sendTopic.c_str(),  messageToSend.c_str());
-        //digitalWrite(TMC_EN, LOW); //Enable stepper motor driver
 
         if (DIRECTION == 1){ //set direction
             digitalWrite(DIR, HIGH);
-          } else {
+          }
+        else {
             digitalWrite(DIR, LOW);
           }
-        for (int i = 0; i < STEPS; i++){
+
+        for (int i = 0; i < STEPS; i++){ //For-loop for amount of steps to do
           digitalWrite(STEP, HIGH);
           delayMicroseconds(delays[STEPSPEED]);
           digitalWrite(STEP, LOW);
           delayMicroseconds(delays[STEPSPEED]);
-          }
-         messageToSend = "{Steps: " + String(STEPS) + ", Speed: " + String(STEPSPEED) + ", TimeToFinish: " + String(moveTime) + ", Status: Done}";
-        client.publish(sendTopic.c_str(),  messageToSend.c_str());
-        //digitalWrite(TMC_EN, HIGH); //Disable stepper motor driver
         }
+
+        messageToSend = "{Steps: " + String(STEPS) + ", Speed: " + String(STEPSPEED) + ", TimeToFinish: " + String(moveTime) + ", Status: Done}"; //combined string with all the infor about requested motion and its status
+        client.publish(sendTopic.c_str(),  messageToSend.c_str());
+      }
       else{
         client.publish(sendTopic.c_str(),  "Error in input: invalid steps, should be greater than 0");
         Serial.println("Error in input: invalid steps, should be greater than 0");
@@ -390,6 +351,5 @@ void doSteps (int DIRECTION, int STEPS, int STEPSPEED){
     client.publish(sendTopic.c_str(),  "Error in input: invalid direction, expected 1 (forward) or 0 (reverse)");
     Serial.println("Error in input: invalid direction, expected 1 (forward) or 0 (reverse)");
   }
-  stepper_driver.disable();
-
+  stepper_driver.disable();//disables motor
 }
